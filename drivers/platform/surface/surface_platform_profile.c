@@ -9,6 +9,7 @@
 #include <linux/unaligned.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/platform_device.h>
 #include <linux/platform_profile.h>
 #include <linux/types.h>
 
@@ -46,6 +47,7 @@ struct ssam_tmp_profile_info {
 struct ssam_platform_profile_device {
 	struct ssam_device *sdev;
 	struct device *ppdev;
+	struct platform_device *pdev;
 	bool has_fan;
 };
 
@@ -70,6 +72,20 @@ SSAM_DEFINE_SYNC_REQUEST_W(__ssam_fan_state_set, u8, {
 	.target_category = SSAM_SSH_TC_FAN,
 	.target_id = SSAM_SSH_TID_SAM,
 	.command_id = 0x0f,
+	.instance_id = 0x01,
+});
+
+SSAM_DEFINE_SYNC_REQUEST_W(__ssam_fan_tmp_offset_set, __le32, {
+	.target_category = SSAM_SSH_TC_FAN,
+	.target_id = SSAM_SSH_TID_SAM,
+	.command_id = 0x0c,
+	.instance_id = 0x01,
+});
+
+SSAM_DEFINE_SYNC_REQUEST_R(__ssam_fan_tmp_offset_get, __le32, {
+	.target_category = SSAM_SSH_TC_FAN,
+	.target_id = SSAM_SSH_TID_SAM,
+	.command_id = 0x0d,
 	.instance_id = 0x01,
 });
 
@@ -105,6 +121,26 @@ static int ssam_fan_state_set(struct ssam_device *sdev, enum ssam_fan_state s)
 	const u8 state = s;
 
 	return ssam_retry(__ssam_fan_state_set, sdev->ctrl, &state);
+}
+
+static int ssam_fan_tmp_offset_set(struct ssam_device *sdev, const u32 o)
+{
+	const __le32 offset = cpu_to_le32(o);
+
+	return ssam_retry(__ssam_fan_tmp_offset_set, sdev->ctrl, &offset);
+}
+
+static int ssam_fan_tmp_offset_get(struct ssam_device *sdev, u32 *o)
+{
+	__le32 offset;
+	int status;
+
+	status = ssam_retry(__ssam_fan_tmp_offset_get, sdev->ctrl, &offset);
+	if (status < 0)
+		return status;
+
+	*o = le32_to_cpu(offset);
+	return 0;
 }
 
 static int convert_ssam_tmp_to_profile(struct ssam_device *sdev, enum ssam_tmp_profile p)
@@ -236,9 +272,109 @@ static const struct platform_profile_ops ssam_platform_profile_ops = {
 	.profile_set = ssam_platform_profile_set,
 };
 
+static inline u32 fixed_milli_to_float(const u32 fixed)
+{
+	u32 sign = (fixed < 0) ? 0x80000000 : 0x00000000;
+
+	u32 abs_fixed = (fixed < 0) ? (u32)(-fixed) : (u32)fixed;
+
+	int lz = __builtin_clz(abs_fixed);
+	int msb = (int)(sizeof(abs_fixed) * 8) - 1 - lz;
+
+	u32 normalized = abs_fixed << lz;
+
+	u32 aligned_mantissa = (u64)normalized * 4398046511ULL >> 32;
+
+	int unbiased_exponent = 127 + msb - 10;
+
+	if (aligned_mantissa < normalized) {
+		aligned_mantissa >>= 1;
+		unbiased_exponent += 1;
+	}
+
+	u32 exponent = (u32)unbiased_exponent << 23;
+
+	u32 mantissa = (aligned_mantissa >> 8) & 0x007FFFFF;
+
+	return sign | exponent | mantissa;
+}
+
+static inline u32 float_to_fixed_milli(const u32 input)
+{
+	u32 fixed = ((input & 0x007FFFFF) | 0x00800000) << 8;
+
+	fixed = (u64)fixed * 4194304000ULL >> 32;
+
+	u32 exponent = (input >> 23) & 0xFF;
+
+	int msb = exponent - 127 + 10;
+	if (msb < 0)
+		return 0;
+
+	int lz = (int)(sizeof(input) * 8) - 1 - msb;
+
+	fixed = fixed >> lz;
+
+	if (input >> 31)
+		fixed = ((fixed ^ 0xFFFFFFFF) + 1) | 0x80000000;
+
+	return fixed;
+}
+
+static ssize_t fan_temp_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ssam_platform_profile_device *tpd;
+	u32 degrees_float;
+
+	tpd = dev_get_drvdata(dev);
+
+	ssam_fan_tmp_offset_get(tpd->sdev, &degrees_float);
+
+	const long int millidegrees = float_to_fixed_milli(degrees_float);
+
+	return sysfs_emit(buf, "%ld\n", millidegrees);
+}
+
+static ssize_t fan_temp_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct ssam_platform_profile_device *tpd;
+	int status;
+	long int millidegrees;
+
+	tpd = dev_get_drvdata(dev);
+
+	if (kstrtol(buf, 10, &millidegrees) < 0)
+		return -EINVAL;
+
+	const u32 degrees_float = fixed_milli_to_float(millidegrees);
+
+	status = ssam_fan_tmp_offset_set(tpd->sdev, degrees_float);
+	if (status < 0)
+		return status;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(fan_temp_offset);
+
+static struct attribute *pdev_attrs[] = {
+	&dev_attr_fan_temp_offset.attr,
+	NULL,
+};
+
+ATTRIBUTE_GROUPS(pdev);
+
+static void surface_platform_profile_unregister_pdev(void *data)
+{
+	struct platform_device *pdev = data;
+
+	platform_device_unregister(pdev);
+}
+
 static int surface_platform_profile_probe(struct ssam_device *sdev)
 {
 	struct ssam_platform_profile_device *tpd;
+	int ret;
 
 	tpd = devm_kzalloc(&sdev->dev, sizeof(*tpd), GFP_KERNEL);
 	if (!tpd)
@@ -252,7 +388,34 @@ static int surface_platform_profile_probe(struct ssam_device *sdev)
 	tpd->ppdev = devm_platform_profile_register(&sdev->dev, "Surface Platform Profile",
 						    tpd, &ssam_platform_profile_ops);
 
-	return PTR_ERR_OR_ZERO(tpd->ppdev);
+	if (IS_ERR(tpd->ppdev))
+		return PTR_ERR(tpd->ppdev);
+
+	if (tpd->has_fan) {
+
+		tpd->pdev = platform_device_alloc("surface_platform_profile", PLATFORM_DEVID_NONE);
+
+		if (!tpd->pdev)
+			return -ENOMEM;
+
+		tpd->pdev->dev.parent = &sdev->dev;
+		tpd->pdev->dev.groups = pdev_groups;
+
+		ret = platform_device_add(tpd->pdev);
+		if (ret) {
+			platform_device_put(tpd->pdev);
+			return ret;
+		}
+
+		dev_set_drvdata(&tpd->pdev->dev, tpd);
+
+		ret = devm_add_action_or_reset(&sdev->dev, surface_platform_profile_unregister_pdev, tpd->pdev);
+		if (ret)
+			return ret;
+
+	}
+
+	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP
