@@ -89,6 +89,13 @@ SSAM_DEFINE_SYNC_REQUEST_R(__ssam_fan_tmp_offset_get, __le32, {
 	.instance_id = 0x01,
 });
 
+SSAM_DEFINE_SYNC_REQUEST_W(__ssam_fan_base_rpm_set, __le16, {
+	.target_category = SSAM_SSH_TC_FAN,
+	.target_id = SSAM_SSH_TID_SAM,
+	.command_id = 0x0b,
+	.instance_id = 0x01,
+});
+
 static int ssam_tmp_profile_get(struct ssam_device *sdev, enum ssam_tmp_profile *p)
 {
 	struct ssam_tmp_profile_info info;
@@ -141,6 +148,13 @@ static int ssam_fan_tmp_offset_get(struct ssam_device *sdev, u32 *o)
 
 	*o = le32_to_cpu(offset);
 	return 0;
+}
+
+static int ssam_fan_base_rpm_set(struct ssam_device *sdev, const u16 r)
+{
+	const __le16 rpm = cpu_to_le16(r);
+
+	return ssam_retry(__ssam_fan_base_rpm_set, sdev->ctrl, &rpm);
 }
 
 static int convert_ssam_tmp_to_profile(struct ssam_device *sdev, enum ssam_tmp_profile p)
@@ -355,10 +369,30 @@ static ssize_t fan_temp_offset_store(struct device *dev, struct device_attribute
 	return count;
 }
 
+static ssize_t fan_base_rpm_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct ssam_platform_profile_device *tpd;
+	int status;
+	long int rpm;
+
+	tpd = dev_get_drvdata(dev);
+
+	if (kstrtol(buf, 10, &rpm) < 0)
+		return -EINVAL;
+
+	status = ssam_fan_base_rpm_set(tpd->sdev, rpm);
+	if (status < 0)
+		return status;
+
+	return count;
+}
+
 static DEVICE_ATTR_RW(fan_temp_offset);
+static DEVICE_ATTR_WO(fan_base_rpm);
 
 static struct attribute *pdev_attrs[] = {
 	&dev_attr_fan_temp_offset.attr,
+	&dev_attr_fan_base_rpm.attr,
 	NULL,
 };
 
@@ -393,7 +427,7 @@ static int surface_platform_profile_probe(struct ssam_device *sdev)
 
 	if (tpd->has_fan) {
 
-		tpd->pdev = platform_device_alloc("surface_platform_profile", PLATFORM_DEVID_NONE);
+		tpd->pdev = platform_device_alloc("surface_fan_profile", PLATFORM_DEVID_NONE);
 
 		if (!tpd->pdev)
 			return -ENOMEM;
